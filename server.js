@@ -1,10 +1,13 @@
-// server.js — Global counter + claim engine + cloud user data (zero dependencies)
+// server.js — Global counter + claim engine + cloud user data + admin stats endpoint
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const DATA_FILE = path.join(__dirname, 'miners.json');
 const PORT = process.env.PORT || 3000;
+
+// ---- CHANGE THIS TO YOUR OWN SECRET KEY ----
+const ADMIN_KEY = 'mysecret123';
 
 // --------------- Persistent data ---------------
 let data = {
@@ -151,6 +154,27 @@ const server = http.createServer(async (req, res) => {
     const userData = (data.users && data.users[accountId]) || null;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ userData }));
+  }
+
+  // --- Admin stats (protected) ---
+  else if (req.method === 'GET' && req.url.startsWith('/admin-stats')) {
+    const url = new URL(req.url, `http://localhost`);
+    const key = url.searchParams.get('key');
+
+    if (key !== ADMIN_KEY) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Forbidden' }));
+    }
+
+    const stats = {
+      totalMiners: data.totalMiners,
+      totalDistributed: data.totalDistributed,
+      minersCounted: data.minersCounted,
+      claims: data.claims,
+      users: data.users
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(stats));
   }
 
   // --- Fallback ---
