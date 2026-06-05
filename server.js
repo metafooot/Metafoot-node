@@ -1,4 +1,4 @@
-// server.js — Global miner counter + claim engine (zero dependencies)
+// server.js — Global counter + claim engine + cloud user data (zero dependencies)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -7,7 +7,14 @@ const DATA_FILE = path.join(__dirname, 'miners.json');
 const PORT = process.env.PORT || 3000;
 
 // --------------- Persistent data ---------------
-let data = { minersCounted: {}, totalMiners: 0, totalDistributed: 0, claims: {} };
+let data = {
+  minersCounted: {},   // { accountId: true }
+  totalMiners: 0,
+  totalDistributed: 0,
+  claims: {},          // { accountId: timestamp }
+  users: {}            // { accountId: userData }
+};
+
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -111,6 +118,42 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ totalDistributed: data.totalDistributed }));
   }
 
+  // --- Save user data (cloud sync) ---
+  else if (req.method === 'POST' && req.url === '/save-user') {
+    try {
+      const { accountId, userData } = await parseBody(req);
+      if (!accountId || !userData) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Missing accountId or userData' }));
+      }
+      if (!data.users) data.users = {};
+      data.users[accountId] = {
+        ...userData,
+        serverTimestamp: Date.now()
+      };
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
+  // --- Load user data ---
+  else if (req.method === 'GET' && req.url.startsWith('/load-user')) {
+    const url = new URL(req.url, `http://localhost`);
+    const accountId = url.searchParams.get('accountId');
+    if (!accountId) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: 'Missing accountId' }));
+    }
+    const userData = (data.users && data.users[accountId]) || null;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ userData }));
+  }
+
+  // --- Fallback ---
   else {
     res.writeHead(404);
     res.end('Not found');
