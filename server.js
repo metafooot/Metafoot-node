@@ -58,7 +58,7 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // --- Health check (for UptimeRobot) ---
+  // --- Health check (for UptimeRobot / cron-job) ---
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('OK');
@@ -149,7 +149,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --- Load user data ---
+  // --- Load user data (now includes authoritative last server claim time) ---
   else if (req.method === 'GET' && req.url.startsWith('/load-user')) {
     const url = new URL(req.url, `http://localhost`);
     const accountId = url.searchParams.get('accountId');
@@ -158,8 +158,9 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: 'Missing accountId' }));
     }
     const userData = (data.users && data.users[accountId]) || null;
+    const lastServerClaim = data.claims[accountId] || null;   // <-- authoritative claim time
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ userData }));
+    res.end(JSON.stringify({ userData, lastServerClaim }));
   }
 
   // --- Admin stats (protected) ---
