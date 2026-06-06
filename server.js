@@ -1,4 +1,4 @@
-// server.js — Global counter + claim engine + cloud user data + admin stats + health check
+// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -15,12 +15,14 @@ let data = {
   totalMiners: 0,
   totalDistributed: 0,
   claims: {},          // { accountId: timestamp }
-  users: {}            // { accountId: userData }
+  users: {},           // { accountId: userData }
+  referrals: []        // { referrer: string, referred: string, timestamp: number }
 };
 
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (!data.referrals) data.referrals = [];
   }
 } catch (e) {}
 
@@ -46,6 +48,17 @@ function getCurrentRate() {
   if (m < 500000) return 1;
   if (m < 1000000) return 0.5;
   return 0.25;
+}
+
+function getReferralReward() {
+  // same halving logic as frontend
+  const miners = data.totalMiners;
+  const base = 2;
+  if (miners < 15000) return base;
+  if (miners < 100000) return base / 2;
+  if (miners < 500000) return base / 4;
+  if (miners < 1000000) return base / 8;
+  return base / 16;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -149,7 +162,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --- Load user data (now includes authoritative last server claim time) ---
+  // --- Load user data (now includes authoritative claim time and referral info) ---
   else if (req.method === 'GET' && req.url.startsWith('/load-user')) {
     const url = new URL(req.url, `http://localhost`);
     const accountId = url.searchParams.get('accountId');
@@ -158,9 +171,73 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: 'Missing accountId' }));
     }
     const userData = (data.users && data.users[accountId]) || null;
-    const lastServerClaim = data.claims[accountId] || null;   // <-- authoritative claim time
+    const lastServerClaim = data.claims[accountId] || null;
+
+    // Build referral info for the inviter (those who used this user's referral code)
+    const inviterReferralCode = userData?.referralCode || accountId; // fallback
+    const referredList = data.referrals
+      .filter(r => r.referrer === inviterReferralCode)
+      .map(r => ({ referred: r.referred, timestamp: r.timestamp }));
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ userData, lastServerClaim }));
+    res.end(JSON.stringify({
+      userData,
+      lastServerClaim,
+      referralInfo: {
+        count: referredList.length,
+        referred: referredList
+      }
+    }));
+  }
+
+  // --- Server-side referral: add referral pair and credit inviter ---
+  else if (req.method === 'POST' && req.url === '/referral-add') {
+    try {
+      const { referrerCode, referredCode } = await parseBody(req);
+      if (!referrerCode || !referredCode || referrerCode.length !== 12 || referredCode.length !== 12) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Invalid codes' }));
+      }
+
+      // Prevent self-referral
+      if (referrerCode === referredCode) {
+        return res.end(JSON.stringify({ error: 'Self-referral not allowed' }));
+      }
+
+      // Check duplicate
+      const alreadyExists = data.referrals.some(
+        r => r.referrer === referrerCode && r.referred === referredCode
+      );
+      if (alreadyExists) {
+        return res.end(JSON.stringify({ error: 'Already connected' }));
+      }
+
+      // Save referral record
+      data.referrals.push({
+        referrer: referrerCode,
+        referred: referredCode,
+        timestamp: Date.now()
+      });
+
+      // Credit inviter's balance on the server
+      const reward = getReferralReward();
+      if (!data.users[referrerCode]) {
+        data.users[referrerCode] = { balance: 0 };
+      }
+      data.users[referrerCode].balance = (data.users[referrerCode].balance || 0) + reward;
+
+      saveData();
+
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        success: true,
+        reward: reward,
+        message: `Referral added. Inviter credited with ${reward} $FOOT.`
+      }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
   }
 
   // --- Admin stats (protected) ---
@@ -178,7 +255,8 @@ const server = http.createServer(async (req, res) => {
       totalDistributed: data.totalDistributed,
       minersCounted: data.minersCounted,
       claims: data.claims,
-      users: data.users
+      users: data.users,
+      referrals: data.referrals
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(stats));
