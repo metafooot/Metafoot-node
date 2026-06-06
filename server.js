@@ -1,4 +1,4 @@
-// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server
+// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server (fixed mapping)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -11,18 +11,23 @@ const ADMIN_KEY = 'mysecret123';
 
 // --------------- Persistent data ---------------
 let data = {
-  minersCounted: {},   // { accountId: true }
+  minersCounted: {},      // { accountId: true }
   totalMiners: 0,
   totalDistributed: 0,
-  claims: {},          // { accountId: timestamp }
-  users: {},           // { accountId: userData }
-  referrals: []        // { referrer: string, referred: string, timestamp: number }
+  claims: {},             // { accountId: timestamp }
+  users: {},              // { accountId: userData }
+  referrals: [],          // { referrer: string (referralCode), referred: string (referralCode), timestamp: number }
+  accountRefCodes: {},    // { accountId: referralCode }
+  refCodeToAccount: {}    // { referralCode: accountId }
 };
 
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    // Ensure new fields exist
     if (!data.referrals) data.referrals = [];
+    if (!data.accountRefCodes) data.accountRefCodes = {};
+    if (!data.refCodeToAccount) data.refCodeToAccount = {};
   }
 } catch (e) {}
 
@@ -51,7 +56,6 @@ function getCurrentRate() {
 }
 
 function getReferralReward() {
-  // same halving logic as frontend
   const miners = data.totalMiners;
   const base = 2;
   if (miners < 15000) return base;
@@ -77,15 +81,21 @@ const server = http.createServer(async (req, res) => {
     return res.end('OK');
   }
 
-  // --- Register new miner ---
+  // --- Register new miner (now also accepts referralCode) ---
   if (req.method === 'POST' && req.url === '/register-miner') {
     try {
-      const { accountId } = await parseBody(req);
+      const { accountId, referralCode } = await parseBody(req);
       if (!accountId || accountId.length !== 12) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Invalid accountId' }));
       }
+      // Store referral code mapping if provided
+      if (referralCode && referralCode.length === 12) {
+        data.accountRefCodes[accountId] = referralCode;
+        data.refCodeToAccount[referralCode] = accountId;
+      }
       if (data.minersCounted[accountId]) {
+        saveData();
         return res.end(JSON.stringify({ alreadyCounted: true, totalMiners: data.totalMiners }));
       }
       data.minersCounted[accountId] = true;
@@ -153,6 +163,11 @@ const server = http.createServer(async (req, res) => {
         ...userData,
         serverTimestamp: Date.now()
       };
+      // Update referral code mapping if userData contains it
+      if (userData.referralCode) {
+        data.accountRefCodes[accountId] = userData.referralCode;
+        data.refCodeToAccount[userData.referralCode] = accountId;
+      }
       saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true }));
@@ -162,7 +177,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --- Load user data (now includes authoritative claim time and referral info) ---
+  // --- Load user data (now uses accountRefCodes as fallback for referral lookup) ---
   else if (req.method === 'GET' && req.url.startsWith('/load-user')) {
     const url = new URL(req.url, `http://localhost`);
     const accountId = url.searchParams.get('accountId');
@@ -173,11 +188,14 @@ const server = http.createServer(async (req, res) => {
     const userData = (data.users && data.users[accountId]) || null;
     const lastServerClaim = data.claims[accountId] || null;
 
-    // Build referral info for the inviter (those who used this user's referral code)
-    const inviterReferralCode = userData?.referralCode || accountId; // fallback
-    const referredList = data.referrals
-      .filter(r => r.referrer === inviterReferralCode)
-      .map(r => ({ referred: r.referred, timestamp: r.timestamp }));
+    // Get the inviter's referral code (prefer userData, fallback to mapping)
+    let inviterReferralCode = userData?.referralCode || data.accountRefCodes[accountId] || null;
+    let referredList = [];
+    if (inviterReferralCode) {
+      referredList = data.referrals
+        .filter(r => r.referrer === inviterReferralCode)
+        .map(r => ({ referred: r.referred, timestamp: r.timestamp }));
+    }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -190,7 +208,7 @@ const server = http.createServer(async (req, res) => {
     }));
   }
 
-  // --- Server-side referral: add referral pair and credit inviter ---
+  // --- Server-side referral: add referral pair and credit inviter (using mapping) ---
   else if (req.method === 'POST' && req.url === '/referral-add') {
     try {
       const { referrerCode, referredCode } = await parseBody(req);
@@ -219,20 +237,23 @@ const server = http.createServer(async (req, res) => {
         timestamp: Date.now()
       });
 
-      // Credit inviter's balance on the server
-      const reward = getReferralReward();
-      if (!data.users[referrerCode]) {
-        data.users[referrerCode] = { balance: 0 };
-      }
-      data.users[referrerCode].balance = (data.users[referrerCode].balance || 0) + reward;
+      // Credit inviter's balance using the mapping from referral code to account ID
+      const inviterAccountId = data.refCodeToAccount[referrerCode];
+      if (inviterAccountId) {
+        const reward = getReferralReward();
+        if (!data.users[inviterAccountId]) {
+          data.users[inviterAccountId] = { balance: 0 };
+        }
+        data.users[inviterAccountId].balance = (data.users[inviterAccountId].balance || 0) + reward;
+      } // else inviter hasn't registered their mapping yet; still safe
 
       saveData();
 
       res.writeHead(200);
       res.end(JSON.stringify({
         success: true,
-        reward: reward,
-        message: `Referral added. Inviter credited with ${reward} $FOOT.`
+        reward: getReferralReward(),
+        message: 'Referral added. Inviter will be credited when their mapping is known.'
       }));
     } catch (e) {
       res.writeHead(400);
@@ -256,7 +277,8 @@ const server = http.createServer(async (req, res) => {
       minersCounted: data.minersCounted,
       claims: data.claims,
       users: data.users,
-      referrals: data.referrals
+      referrals: data.referrals,
+      accountRefCodes: data.accountRefCodes
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(stats));
