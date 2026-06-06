@@ -1,4 +1,4 @@
-// server.js — Global counter + claim engine + cloud user data + admin stats endpoint
+// server.js — Global counter + claim engine + cloud user data + admin stats + health check
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -56,6 +56,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
     return res.end();
+  }
+
+  // --- Health check (for UptimeRobot) ---
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('OK');
   }
 
   // --- Register new miner ---
