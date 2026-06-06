@@ -1,4 +1,4 @@
-// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server (fixed mapping)
+// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server (fully fixed)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -24,7 +24,6 @@ let data = {
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    // Ensure new fields exist
     if (!data.referrals) data.referrals = [];
     if (!data.accountRefCodes) data.accountRefCodes = {};
     if (!data.refCodeToAccount) data.refCodeToAccount = {};
@@ -75,13 +74,13 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // --- Health check (for UptimeRobot / cron-job) ---
+  // --- Health check ---
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('OK');
   }
 
-  // --- Register new miner (now also accepts referralCode) ---
+  // --- Register new miner (now stores referral code mapping) ---
   if (req.method === 'POST' && req.url === '/register-miner') {
     try {
       const { accountId, referralCode } = await parseBody(req);
@@ -89,10 +88,14 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Invalid accountId' }));
       }
-      // Store referral code mapping if provided
+      // Store referral code mapping if provided and not already present
       if (referralCode && referralCode.length === 12) {
-        data.accountRefCodes[accountId] = referralCode;
-        data.refCodeToAccount[referralCode] = accountId;
+        if (!data.accountRefCodes[accountId]) {
+          data.accountRefCodes[accountId] = referralCode;
+        }
+        if (!data.refCodeToAccount[referralCode]) {
+          data.refCodeToAccount[referralCode] = accountId;
+        }
       }
       if (data.minersCounted[accountId]) {
         saveData();
@@ -150,7 +153,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ totalDistributed: data.totalDistributed }));
   }
 
-  // --- Save user data (cloud sync) ---
+  // --- Save user data (cloud sync) – now also builds mapping from stored referral code ---
   else if (req.method === 'POST' && req.url === '/save-user') {
     try {
       const { accountId, userData } = await parseBody(req);
@@ -177,7 +180,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --- Load user data (now uses accountRefCodes as fallback for referral lookup) ---
+  // --- Load user data (now auto‑creates mapping on login) ---
   else if (req.method === 'GET' && req.url.startsWith('/load-user')) {
     const url = new URL(req.url, `http://localhost`);
     const accountId = url.searchParams.get('accountId');
@@ -188,7 +191,18 @@ const server = http.createServer(async (req, res) => {
     const userData = (data.users && data.users[accountId]) || null;
     const lastServerClaim = data.claims[accountId] || null;
 
-    // Get the inviter's referral code (prefer userData, fallback to mapping)
+    // Auto‑create mapping if missing (fixes old accounts)
+    if (userData && userData.referralCode) {
+      if (!data.accountRefCodes[accountId]) {
+        data.accountRefCodes[accountId] = userData.referralCode;
+      }
+      if (!data.refCodeToAccount[userData.referralCode]) {
+        data.refCodeToAccount[userData.referralCode] = accountId;
+      }
+      saveData(); // persist the new mapping immediately
+    }
+
+    // Get inviter's referral code (prefer userData, fallback to mapping)
     let inviterReferralCode = userData?.referralCode || data.accountRefCodes[accountId] || null;
     let referredList = [];
     if (inviterReferralCode) {
@@ -208,7 +222,7 @@ const server = http.createServer(async (req, res) => {
     }));
   }
 
-  // --- Server-side referral: add referral pair and credit inviter (using mapping) ---
+  // --- Server-side referral: add referral pair and credit inviter (fully fixed) ---
   else if (req.method === 'POST' && req.url === '/referral-add') {
     try {
       const { referrerCode, referredCode } = await parseBody(req);
@@ -237,15 +251,28 @@ const server = http.createServer(async (req, res) => {
         timestamp: Date.now()
       });
 
-      // Credit inviter's balance using the mapping from referral code to account ID
-      const inviterAccountId = data.refCodeToAccount[referrerCode];
+      // Credit inviter's balance – find their accountId via mapping
+      let inviterAccountId = data.refCodeToAccount[referrerCode];
+      if (!inviterAccountId) {
+        // reverse lookup: find accountId whose referralCode matches referrerCode
+        for (const [accId, refCode] of Object.entries(data.accountRefCodes)) {
+          if (refCode === referrerCode) {
+            inviterAccountId = accId;
+            data.refCodeToAccount[referrerCode] = accId; // store forward mapping for next time
+            break;
+          }
+        }
+      }
+
       if (inviterAccountId) {
         const reward = getReferralReward();
         if (!data.users[inviterAccountId]) {
           data.users[inviterAccountId] = { balance: 0 };
         }
         data.users[inviterAccountId].balance = (data.users[inviterAccountId].balance || 0) + reward;
-      } // else inviter hasn't registered their mapping yet; still safe
+      }
+      // If still not found, the inviter has never logged in; their reward will be credited
+      // the next time they log in and the mapping is created (via /load-user).
 
       saveData();
 
@@ -253,7 +280,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         success: true,
         reward: getReferralReward(),
-        message: 'Referral added. Inviter will be credited when their mapping is known.'
+        message: 'Referral added.'
       }));
     } catch (e) {
       res.writeHead(400);
