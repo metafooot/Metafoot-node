@@ -1,9 +1,10 @@
-// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server (code‑based) + timer fix
+// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server + updates system
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const DATA_FILE = path.join(__dirname, 'miners.json');
+const UPDATES_FILE = path.join(__dirname, 'updates.json');
 const PORT = process.env.PORT || 3000;
 
 // ---- CHANGE THIS TO YOUR OWN SECRET KEY ----
@@ -21,6 +22,14 @@ let data = {
   referralFriends: {}     // { referralCode: [ { referred, timestamp } ] }
 };
 
+// Load or create updates array
+let updates = [];
+try {
+  if (fs.existsSync(UPDATES_FILE)) {
+    updates = JSON.parse(fs.readFileSync(UPDATES_FILE, 'utf8'));
+  }
+} catch (e) {}
+
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -32,6 +41,10 @@ try {
 
 function saveData() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data));
+}
+
+function saveUpdates() {
+  fs.writeFileSync(UPDATES_FILE, JSON.stringify(updates));
 }
 
 // Helper: read JSON body
@@ -66,7 +79,7 @@ function getReferralReward() {
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
@@ -80,8 +93,68 @@ const server = http.createServer(async (req, res) => {
     return res.end('OK');
   }
 
+  // --- Public updates feed ---
+  if (req.method === 'GET' && req.url === '/updates') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(updates));
+  }
+
+  // --- Admin: post an update ---
+  if (req.method === 'POST' && req.url.startsWith('/admin-update')) {
+    const url = new URL(req.url, `http://localhost`);
+    const key = url.searchParams.get('key');
+    if (key !== ADMIN_KEY) {
+      res.writeHead(403);
+      return res.end(JSON.stringify({ error: 'Forbidden' }));
+    }
+    try {
+      const { title, content } = await parseBody(req);
+      if (!title || !content) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Missing title or content' }));
+      }
+      const newUpdate = {
+        id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+        title,
+        content,
+        date: new Date().toISOString().split('T')[0]
+      };
+      updates.unshift(newUpdate);  // newest first
+      saveUpdates();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, update: newUpdate }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
+  // --- Admin: delete an update ---
+  if (req.method === 'DELETE' && req.url.startsWith('/admin-update')) {
+    const url = new URL(req.url, `http://localhost`);
+    const key = url.searchParams.get('key');
+    if (key !== ADMIN_KEY) {
+      res.writeHead(403);
+      return res.end(JSON.stringify({ error: 'Forbidden' }));
+    }
+    const id = url.searchParams.get('id');
+    if (!id) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: 'Missing id' }));
+    }
+    const index = updates.findIndex(u => u.id === id);
+    if (index === -1) {
+      res.writeHead(404);
+      return res.end(JSON.stringify({ error: 'Update not found' }));
+    }
+    updates.splice(index, 1);
+    saveUpdates();
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true }));
+  }
+
   // --- Register new miner ---
-  if (req.method === 'POST' && req.url === '/register-miner') {
+  else if (req.method === 'POST' && req.url === '/register-miner') {
     try {
       const { accountId } = await parseBody(req);
       if (!accountId || accountId.length !== 12) {
@@ -165,7 +238,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --- Load user data (now includes lastServerClaim for timer fix) ---
+  // --- Load user data ---
   else if (req.method === 'GET' && req.url.startsWith('/load-user')) {
     const url = new URL(req.url, `http://localhost`);
     const accountId = url.searchParams.get('accountId');
@@ -174,13 +247,12 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: 'Missing accountId' }));
     }
     const userData = (data.users && data.users[accountId]) || null;
-    const lastServerClaim = data.claims[accountId] || null;   // <-- authoritative claim time
-
+    const lastServerClaim = data.claims[accountId] || null;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ userData, lastServerClaim }));
   }
 
-  // --- Server-side referral: add referral pair and credit inviter ---
+  // --- Server-side referral ---
   else if (req.method === 'POST' && req.url === '/referral-add') {
     try {
       const { referrerCode, referredCode } = await parseBody(req);
@@ -227,7 +299,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --- Get referral info by referral code ---
+  // --- Get referral info ---
   else if (req.method === 'GET' && req.url.startsWith('/referral-info')) {
     const url = new URL(req.url, `http://localhost`);
     const code = url.searchParams.get('code');
