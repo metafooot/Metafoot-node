@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 
 const DATA_FILE = path.join(__dirname, 'miners.json');
-const UPDATES_FILE = path.join(__dirname, 'updates.json');
 const PORT = process.env.PORT || 3000;
 
 // ---- CHANGE THIS TO YOUR OWN SECRET KEY ----
@@ -19,32 +18,28 @@ let data = {
   users: {},              // { accountId: userData }
   referrals: [],          // { referrer: string (referralCode), referred: string (referralCode), timestamp: number }
   referralRewards: {},    // { referralCode: totalEarned }
-  referralFriends: {}     // { referralCode: [ { referred, timestamp } ] }
+  referralFriends: {},    // { referralCode: [ { referred, timestamp } ] }
+  updates: []             // <--- All updates now live here
 };
-
-// Load or create updates array
-let updates = [];
-try {
-  if (fs.existsSync(UPDATES_FILE)) {
-    updates = JSON.parse(fs.readFileSync(UPDATES_FILE, 'utf8'));
-  }
-} catch (e) {}
 
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    // ensure all keys exist, even if loading an older file
+    if (!data.minersCounted) data.minersCounted = {};
+    if (!data.totalMiners) data.totalMiners = 0;
+    if (!data.totalDistributed) data.totalDistributed = 0;
+    if (!data.claims) data.claims = {};
+    if (!data.users) data.users = {};
     if (!data.referrals) data.referrals = [];
     if (!data.referralRewards) data.referralRewards = {};
     if (!data.referralFriends) data.referralFriends = {};
+    if (!data.updates) data.updates = [];
   }
 } catch (e) {}
 
 function saveData() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data));
-}
-
-function saveUpdates() {
-  fs.writeFileSync(UPDATES_FILE, JSON.stringify(updates));
 }
 
 // Helper: read JSON body
@@ -96,7 +91,7 @@ const server = http.createServer(async (req, res) => {
   // --- Public updates feed ---
   if (req.method === 'GET' && req.url === '/updates') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(updates));
+    return res.end(JSON.stringify(data.updates));
   }
 
   // --- Admin: post an update ---
@@ -119,8 +114,8 @@ const server = http.createServer(async (req, res) => {
         content,
         date: new Date().toISOString().split('T')[0]
       };
-      updates.unshift(newUpdate);  // newest first
-      saveUpdates();
+      data.updates.unshift(newUpdate);  // newest first
+      saveData();  // <--- saves everything together
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, update: newUpdate }));
     } catch (e) {
@@ -142,13 +137,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400);
       return res.end(JSON.stringify({ error: 'Missing id' }));
     }
-    const index = updates.findIndex(u => u.id === id);
+    const index = data.updates.findIndex(u => u.id === id);
     if (index === -1) {
       res.writeHead(404);
       return res.end(JSON.stringify({ error: 'Update not found' }));
     }
-    updates.splice(index, 1);
-    saveUpdates();
+    data.updates.splice(index, 1);
+    saveData();  // <--- saves everything
     res.writeHead(200);
     res.end(JSON.stringify({ success: true }));
   }
