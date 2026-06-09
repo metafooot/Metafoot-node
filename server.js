@@ -115,7 +115,7 @@ const server = http.createServer(async (req, res) => {
         date: new Date().toISOString().split('T')[0]
       };
       data.updates.unshift(newUpdate);  // newest first
-      saveData();  // <--- saves everything together
+      saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, update: newUpdate }));
     } catch (e) {
@@ -143,7 +143,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: 'Update not found' }));
     }
     data.updates.splice(index, 1);
-    saveData();  // <--- saves everything
+    saveData();
     res.writeHead(200);
     res.end(JSON.stringify({ success: true }));
   }
@@ -191,7 +191,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Already claimed today', remainingMs: remaining }));
       }
       const rate = getCurrentRate();
-      const cap = 50000000;
+      const cap = 150000000;   // 150M airdrop cap
       if (data.totalDistributed + rate > cap) {
         return res.end(JSON.stringify({ error: 'Airdrop cap reached' }));
       }
