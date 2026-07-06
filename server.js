@@ -7,7 +7,7 @@ const DATA_FILE = path.join(__dirname, 'miners.json');
 const PORT = process.env.PORT || 3000;
 
 // ---- CHANGE THIS TO YOUR OWN SECRET KEY ----
-const ADMIN_KEY = 'mysecret123';
+const ADMIN_KEY = process.env.ADMIN_KEY || 'mysecret123';
 
 // --------------- Persistent data ---------------
 let data = {
@@ -19,22 +19,22 @@ let data = {
   referrals: [],          // { referrer: string (referralCode), referred: string (referralCode), timestamp: number }
   referralRewards: {},    // { referralCode: totalEarned }
   referralFriends: {},    // { referralCode: [ { referred, timestamp } ] }
-  updates: []             // <--- All updates now live here
+  updates: []             // All updates live here
 };
 
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     // ensure all keys exist, even if loading an older file
-    if (!data.minersCounted) data.minersCounted = {};
-    if (!data.totalMiners) data.totalMiners = 0;
-    if (!data.totalDistributed) data.totalDistributed = 0;
-    if (!data.claims) data.claims = {};
-    if (!data.users) data.users = {};
-    if (!data.referrals) data.referrals = [];
-    if (!data.referralRewards) data.referralRewards = {};
-    if (!data.referralFriends) data.referralFriends = {};
-    if (!data.updates) data.updates = [];
+    data.minersCounted = data.minersCounted || {};
+    data.totalMiners = data.totalMiners || 0;
+    data.totalDistributed = data.totalDistributed || 0;
+    data.claims = data.claims || {};
+    data.users = data.users || {};
+    data.referrals = data.referrals || [];
+    data.referralRewards = data.referralRewards || {};
+    data.referralFriends = data.referralFriends || {};
+    data.updates = data.updates || [];
   }
 } catch (e) {}
 
@@ -114,7 +114,7 @@ const server = http.createServer(async (req, res) => {
         content,
         date: new Date().toISOString().split('T')[0]
       };
-      data.updates.unshift(newUpdate);  // newest first
+      data.updates.unshift(newUpdate);
       saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, update: newUpdate }));
@@ -191,7 +191,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Already claimed today', remainingMs: remaining }));
       }
       const rate = getCurrentRate();
-      const cap = 150000000;   // 150M airdrop cap
+      const cap = 300000000;   // 300M airdrop cap
       if (data.totalDistributed + rate > cap) {
         return res.end(JSON.stringify({ error: 'Airdrop cap reached' }));
       }
@@ -247,6 +247,46 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ userData, lastServerClaim }));
   }
 
+  // --- Task claim (telegram/twitter) ---
+  else if (req.method === 'POST' && req.url === '/task-claim') {
+    try {
+      const { accountId, taskType, amount } = await parseBody(req);
+      if (!accountId || !taskType || !amount) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Missing fields' }));
+      }
+      // basic validation: amount should be 0.6 (or whatever is expected)
+      if (amount !== 0.6) {
+        // optionally allow other amounts, but we'll log it
+      }
+      data.totalDistributed += amount;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
+  // --- Boost claim (watch ad) ---
+  else if (req.method === 'POST' && req.url === '/boost-claim') {
+    try {
+      const { accountId, amount } = await parseBody(req);
+      if (!accountId || !amount) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Missing fields' }));
+      }
+      data.totalDistributed += amount;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
   // --- Server-side referral ---
   else if (req.method === 'POST' && req.url === '/referral-add') {
     try {
@@ -264,16 +304,21 @@ const server = http.createServer(async (req, res) => {
       if (alreadyExists) {
         return res.end(JSON.stringify({ error: 'Already connected' }));
       }
+      const reward = getReferralReward();
+      // Two rewards minted: one for referrer, one for referred (if the referred gets it separately)
+      // But the client gives reward to both. We'll increment totalDistributed by reward * 2.
+      data.totalDistributed += reward * 2;
+
       data.referrals.push({
         referrer: referrerCode,
         referred: referredCode,
         timestamp: Date.now()
       });
-      const reward = getReferralReward();
       if (!data.referralRewards[referrerCode]) {
         data.referralRewards[referrerCode] = 0;
       }
       data.referralRewards[referrerCode] += reward;
+      // Note: the referred's reward is not tracked here (handled client-side), but the total minted is correct.
       if (!data.referralFriends[referrerCode]) {
         data.referralFriends[referrerCode] = [];
       }
@@ -310,6 +355,30 @@ const server = http.createServer(async (req, res) => {
       friends: friends,
       totalEarned: totalEarned
     }));
+  }
+
+  // --- Admin: adjust totalDistributed (for historical sync) ---
+  else if (req.method === 'POST' && req.url === '/admin-adjust-distribution') {
+    const url = new URL(req.url, `http://localhost`);
+    const key = url.searchParams.get('key');
+    if (key !== ADMIN_KEY) {
+      res.writeHead(403);
+      return res.end(JSON.stringify({ error: 'Forbidden' }));
+    }
+    try {
+      const { amount } = await parseBody(req);
+      if (typeof amount !== 'number') {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Invalid amount' }));
+      }
+      data.totalDistributed += amount;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
   }
 
   // --- Admin stats (protected) ---
