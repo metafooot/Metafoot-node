@@ -22,6 +22,27 @@ let data = {
   updates: []             // All updates live here
 };
 
+// --------- Training cost constants ---------
+const BASE_COST = 0.3;
+const TIER_SIZE = 20;
+
+function getUpgradeCost(level) {
+  return BASE_COST * Math.pow(2, Math.floor(level / TIER_SIZE));
+}
+
+function getTotalSpent(attrs) {
+  let total = 0;
+  if (!attrs || typeof attrs !== 'object') return 0;
+  for (let attr in attrs) {
+    const lv = attrs[attr] || 0;
+    for (let l = 0; l < lv; l++) {
+      total += getUpgradeCost(l);
+    }
+  }
+  return total;
+}
+// -------------------------------------------
+
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -255,10 +276,6 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400);
         return res.end(JSON.stringify({ error: 'Missing fields' }));
       }
-      // basic validation: amount should be 0.6 (or whatever is expected)
-      if (amount !== 0.6) {
-        // optionally allow other amounts, but we'll log it
-      }
       data.totalDistributed += amount;
       saveData();
       res.writeHead(200);
@@ -305,9 +322,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Already connected' }));
       }
       const reward = getReferralReward();
-      // Two rewards minted: one for referrer, one for referred (if the referred gets it separately)
-      // But the client gives reward to both. We'll increment totalDistributed by reward * 2.
-      data.totalDistributed += reward * 2;
+      data.totalDistributed += reward * 2;   // both referrer and referred receive reward
 
       data.referrals.push({
         referrer: referrerCode,
@@ -318,7 +333,6 @@ const server = http.createServer(async (req, res) => {
         data.referralRewards[referrerCode] = 0;
       }
       data.referralRewards[referrerCode] += reward;
-      // Note: the referred's reward is not tracked here (handled client-side), but the total minted is correct.
       if (!data.referralFriends[referrerCode]) {
         data.referralFriends[referrerCode] = [];
       }
@@ -357,7 +371,7 @@ const server = http.createServer(async (req, res) => {
     }));
   }
 
-  // --- Admin: adjust totalDistributed (for historical sync) ---
+  // --- Admin: adjust totalDistributed (add/subtract) ---
   else if (req.method === 'POST' && req.url === '/admin-adjust-distribution') {
     const url = new URL(req.url, `http://localhost`);
     const key = url.searchParams.get('key');
@@ -378,6 +392,62 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(400);
       res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
+  // --- Admin: set totalDistributed directly ---
+  else if (req.method === 'POST' && req.url === '/admin-set-distribution') {
+    const url = new URL(req.url, `http://localhost`);
+    const key = url.searchParams.get('key');
+    if (key !== ADMIN_KEY) {
+      res.writeHead(403);
+      return res.end(JSON.stringify({ error: 'Forbidden' }));
+    }
+    try {
+      const { value } = await parseBody(req);
+      if (typeof value !== 'number' || value < 0) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Invalid value' }));
+      }
+      data.totalDistributed = value;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
+  // --- Admin: recover totalDistributed from user data ---
+  else if (req.method === 'POST' && req.url === '/admin-recover-distribution') {
+    const url = new URL(req.url, `http://localhost`);
+    const key = url.searchParams.get('key');
+    if (key !== ADMIN_KEY) {
+      res.writeHead(403);
+      return res.end(JSON.stringify({ error: 'Forbidden' }));
+    }
+    try {
+      let total = 0;
+      const users = data.users || {};
+      for (const accountId in users) {
+        const userData = users[accountId];
+        if (userData && typeof userData === 'object') {
+          // Add user balance (if any)
+          total += (userData.balance || 0);
+          // Add training spent (if attributes exist)
+          if (userData.attributes) {
+            total += getTotalSpent(userData.attributes);
+          }
+        }
+      }
+      data.totalDistributed = total;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed, note: 'Recovered from synced user data. This does not include unsynced users or extra bonuses.' }));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: 'Internal error' }));
     }
   }
 
