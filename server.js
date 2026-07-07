@@ -112,6 +112,18 @@ const server = http.createServer(async (req, res) => {
     return res.end('OK');
   }
 
+  // --- Serve admin panel from same origin (fixes CORS) ---
+  if (req.method === 'GET' && req.url === '/admin') {
+    const adminHtmlPath = path.join(__dirname, 'admin.html');
+    if (fs.existsSync(adminHtmlPath)) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      fs.createReadStream(adminHtmlPath).pipe(res);
+    } else {
+      res.writeHead(404);
+      res.end('admin.html not found');
+    }
+  }
+
   // --- Public updates feed ---
   if (req.method === 'GET' && req.url === '/updates') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
