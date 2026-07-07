@@ -1,485 +1,386 @@
-<!DOCTYPE <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>METAFOOT Admin</title>
-  <style>
-    :root {
-      --bg: #0a0a0f;
-      --card: #151520;
-      --text: #ffcccc;
-      --accent: #ff5555;
-      --gold: #ffd700;
+// server.js — Full backend (admin endpoints open – no auth)
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const DATA_FILE = path.join(__dirname, 'miners.json');
+const PORT = process.env.PORT || 3000;
+
+// --------------- Persistent data ---------------
+let data = {
+  minersCounted: {},      // { accountId: true }
+  totalMiners: 0,
+  totalDistributed: 0,
+  claims: {},             // { accountId: timestamp }
+  users: {},              // { accountId: { balance, attributes, username, ... } }
+  referrals: [],
+  referralRewards: {},
+  referralFriends: {},
+  updates: [],
+  stadiumsSold: 0,
+  stadiumOwners: {}
+};
+
+const BASE_COST = 0.3;
+const TIER_SIZE = 20;
+
+function getUpgradeCost(level) {
+  return BASE_COST * Math.pow(2, Math.floor(level / TIER_SIZE));
+}
+
+function getTotalSpent(attrs) {
+  let total = 0;
+  if (!attrs || typeof attrs !== 'object') return 0;
+  for (let attr in attrs) {
+    const lv = attrs[attr] || 0;
+    for (let l = 0; l < lv; l++) total += getUpgradeCost(l);
+  }
+  return total;
+}
+
+try {
+  if (fs.existsSync(DATA_FILE)) {
+    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    data.minersCounted = data.minersCounted || {};
+    data.totalMiners = data.totalMiners || 0;
+    data.totalDistributed = data.totalDistributed || 0;
+    data.claims = data.claims || {};
+    data.users = data.users || {};
+    data.referrals = data.referrals || [];
+    data.referralRewards = data.referralRewards || {};
+    data.referralFriends = data.referralFriends || {};
+    data.updates = data.updates || [];
+    data.stadiumsSold = data.stadiumsSold || 0;
+    data.stadiumOwners = data.stadiumOwners || {};
+  }
+} catch (e) {}
+
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data));
+}
+
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => (body += chunk));
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+    });
+  });
+}
+
+function getCurrentRate() {
+  const m = data.totalMiners;
+  if (m < 15000) return 4;
+  if (m < 100000) return 2;
+  if (m < 500000) return 1;
+  if (m < 1000000) return 0.5;
+  return 0.25;
+}
+
+function getReferralReward() {
+  const miners = data.totalMiners;
+  const base = 2;
+  if (miners < 15000) return base;
+  if (miners < 100000) return base / 2;
+  if (miners < 500000) return base / 4;
+  if (miners < 1000000) return base / 8;
+  return base / 16;
+}
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    return res.end();
+  }
+
+  // Health check
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('OK');
+  }
+
+  // Public updates feed
+  if (req.method === 'GET' && req.url === '/updates') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(data.updates));
+  }
+
+  // Admin: post an update (NO AUTH)
+  if (req.method === 'POST' && req.url.startsWith('/admin-update')) {
+    try {
+      const { title, content } = await parseBody(req);
+      if (!title || !content) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Missing title or content' }));
+      }
+      const newUpdate = {
+        id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+        title,
+        content,
+        date: new Date().toISOString().split('T')[0]
+      };
+      data.updates.unshift(newUpdate);
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, update: newUpdate }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
     }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; padding: 20px; }
-    h1 { color: var(--accent); margin-bottom: 0.5rem; }
-    .status { color: #ff8888; margin-bottom: 1rem; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
-    .card { background: var(--card); border: 1px solid #333; border-radius: 12px; padding: 1rem; }
-    .card h2 { color: var(--accent); font-size: 1.1rem; margin-bottom: 0.5rem; }
-    .stat { font-size: 2rem; color: var(--gold); }
-    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
-    th, td { border: 1px solid #333; padding: 6px; text-align: left; font-size: 0.9rem; }
-    th { background: #1a1a2a; color: var(--gold); }
-    textarea { width: 100%; background: #1a1a2a; color: white; border: 1px solid var(--accent); padding: 0.5rem; border-radius: 8px; resize: vertical; }
-    .section { margin-top: 2rem; }
-    .btn { padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 6px; cursor: pointer; margin-right: 5px; margin-bottom: 5px; }
-    .danger { background: #990000; }
-    .success { background: #228B22; }
-    pre { background: #111; padding: 1rem; border-radius: 8px; overflow-x: auto; max-height: 300px; }
-    .scrollable { max-height: 500px; overflow-y: auto; }
-  </style>
-</head>
-<body>
-  <h1>⚽ METAFOOT Admin</h1>
-  <p class="status" id="connectionStatus">Connecting…</p>
+  }
 
-  <div id="dashboard" style="display: none;">
-    <div class="grid" id="overviewGrid"></div>
-
-    <!-- Player Attributes Section -->
-    <div class="section">
-      <h2>🏋️ Player Attributes</h2>
-      <div class="scrollable">
-        <table id="attributesTable">
-          <thead>
-            <tr>
-              <th>Account ID</th>
-              <th>Username</th>
-              <th>Balance</th>
-              <th>Speed</th>
-              <th>Shoot</th>
-              <th>Power</th>
-              <th>Intelligence</th>
-              <th>Brilliance</th>
-              <th>Accuracy</th>
-              <th>Total Spent</th>
-            </tr>
-          </thead>
-          <tbody id="attributesBody"></tbody>
-        </table>
-      </div>
-      <p id="noPlayersMsg" style="color:#888; margin-top:1rem;">No players with attributes found.</p>
-    </div>
-
-    <div class="section">
-      <h2>📋 All Data (JSON)</h2>
-      <button class="btn" onclick="copyFullData()">Copy Full JSON</button>
-      <pre id="rawJson"></pre>
-    </div>
-
-    <div class="section">
-      <h2>📝 Manage Updates</h2>
-      <div style="display: flex; gap: 10px; margin-bottom: 10px;">
-        <input type="text" id="updateTitle" placeholder="Title" style="flex:1; padding:8px; background:#1a1a2a; border:1px solid #ff5555; color:white; border-radius:6px;">
-        <textarea id="updateContent" placeholder="Content" rows="2" style="flex:2;"></textarea>
-        <button class="btn success" onclick="postUpdate()">Post Update</button>
-      </div>
-      <div id="updatesList"></div>
-    </div>
-
-    <div class="section">
-      <h2>🔧 Tools</h2>
-      <button class="btn" onclick="adjustDistribution()">Adjust Distribution</button>
-      <button class="btn" onclick="setDistribution()">Set Distribution</button>
-      <button class="btn danger" onclick="recoverDistribution()">Recover from Users</button>
-    </div>
-  </div>
-
-  <script>
-    // No API_BASE needed – we always call the same server we’re on.
-    const ATTR_NAMES = ['speed','shoot','power','intelligence','brilliance','accuracy'];
-    const BASE_COST = 0.3;
-    const TIER_SIZE = 20;
-
-    function getUpgradeCost(level) {
-      return BASE_COST * Math.pow(2, Math.floor(level / TIER_SIZE));
+  // Admin: delete an update (NO AUTH)
+  if (req.method === 'DELETE' && req.url.startsWith('/admin-update')) {
+    const url = new URL(req.url, `http://localhost`);
+    const id = url.searchParams.get('id');
+    if (!id) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: 'Missing id' }));
     }
+    const index = data.updates.findIndex(u => u.id === id);
+    if (index === -1) {
+      res.writeHead(404);
+      return res.end(JSON.stringify({ error: 'Update not found' }));
+    }
+    data.updates.splice(index, 1);
+    saveData();
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true }));
+  }
 
-    function calcTotalSpent(attrs) {
+  // Register new miner
+  else if (req.method === 'POST' && req.url === '/register-miner') {
+    try {
+      const { accountId } = await parseBody(req);
+      if (!accountId || accountId.length !== 12) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Invalid accountId' }));
+      }
+      if (data.minersCounted[accountId]) {
+        return res.end(JSON.stringify({ alreadyCounted: true, totalMiners: data.totalMiners }));
+      }
+      data.minersCounted[accountId] = true;
+      data.totalMiners++;
+      saveData();
+      return res.end(JSON.stringify({ alreadyCounted: false, totalMiners: data.totalMiners }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
+  // Get total miners
+  else if (req.method === 'GET' && req.url === '/total-miners') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ totalMiners: data.totalMiners }));
+  }
+
+  // Claim reward
+  else if (req.method === 'POST' && req.url === '/claim') {
+    try {
+      const { accountId } = await parseBody(req);
+      if (!accountId) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing accountId' })); }
+      const now = Date.now();
+      const lastClaim = data.claims[accountId] || 0;
+      const oneDay = 86400000;
+      if (now - lastClaim < oneDay) {
+        const remaining = oneDay - (now - lastClaim);
+        return res.end(JSON.stringify({ error: 'Already claimed today', remainingMs: remaining }));
+      }
+      const rate = getCurrentRate();
+      const cap = 300000000;
+      if (data.totalDistributed + rate > cap) {
+        return res.end(JSON.stringify({ error: 'Airdrop cap reached' }));
+      }
+      data.claims[accountId] = now;
+      data.totalDistributed += rate;
+      if (data.users[accountId]) {
+        data.users[accountId].balance = (data.users[accountId].balance || 0) + rate;
+      }
+      saveData();
+      res.end(JSON.stringify({ success: true, reward: rate, totalMiners: data.totalMiners, totalDistributed: data.totalDistributed }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Get total distributed
+  else if (req.method === 'GET' && req.url === '/total-distributed') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ totalDistributed: data.totalDistributed }));
+  }
+
+  // Save user data (cloud sync)
+  else if (req.method === 'POST' && req.url === '/save-user') {
+    try {
+      const { accountId, userData } = await parseBody(req);
+      if (!accountId || !userData) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing accountId or userData' })); }
+      data.users[accountId] = { ...userData, serverTimestamp: Date.now() };
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Load user data
+  else if (req.method === 'GET' && req.url.startsWith('/load-user')) {
+    const url = new URL(req.url, `http://localhost`);
+    const accountId = url.searchParams.get('accountId');
+    if (!accountId) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing accountId' })); }
+    const userData = data.users[accountId] || null;
+    const lastServerClaim = data.claims[accountId] || null;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ userData, lastServerClaim }));
+  }
+
+  // Task claim
+  else if (req.method === 'POST' && req.url === '/task-claim') {
+    try {
+      const { accountId, taskType, amount } = await parseBody(req);
+      if (!accountId || !taskType || !amount) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing fields' })); }
+      data.totalDistributed += amount;
+      if (data.users[accountId]) data.users[accountId].balance = (data.users[accountId].balance || 0) + amount;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Boost claim
+  else if (req.method === 'POST' && req.url === '/boost-claim') {
+    try {
+      const { accountId, amount } = await parseBody(req);
+      if (!accountId || !amount) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing fields' })); }
+      data.totalDistributed += amount;
+      if (data.users[accountId]) data.users[accountId].balance = (data.users[accountId].balance || 0) + amount;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Referral add
+  else if (req.method === 'POST' && req.url === '/referral-add') {
+    try {
+      const { referrerCode, referredCode } = await parseBody(req);
+      if (!referrerCode || !referredCode || referrerCode.length !== 12 || referredCode.length !== 12) {
+        res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid codes' }));
+      }
+      if (referrerCode === referredCode) return res.end(JSON.stringify({ error: 'Self-referral not allowed' }));
+      if (data.referrals.some(r => r.referrer === referrerCode && r.referred === referredCode))
+        return res.end(JSON.stringify({ error: 'Already connected' }));
+      const reward = getReferralReward();
+      data.totalDistributed += reward * 2;
+      data.referrals.push({ referrer: referrerCode, referred: referredCode, timestamp: Date.now() });
+      data.referralRewards[referrerCode] = (data.referralRewards[referrerCode] || 0) + reward;
+      data.referralFriends[referrerCode] = data.referralFriends[referrerCode] || [];
+      data.referralFriends[referrerCode].push({ referred: referredCode, timestamp: Date.now() });
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, reward, message: 'Referral added.' }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Referral info
+  else if (req.method === 'GET' && req.url.startsWith('/referral-info')) {
+    const url = new URL(req.url, `http://localhost`);
+    const code = url.searchParams.get('code');
+    if (!code || code.length !== 12) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid referral code' })); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ referralCode: code, friends: data.referralFriends[code] || [], totalEarned: data.referralRewards[code] || 0 }));
+  }
+
+  // Stadium info
+  else if (req.method === 'GET' && req.url === '/stadium-info') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ sold: data.stadiumsSold, total: 1000 }));
+  }
+
+  // Buy stadium
+  else if (req.method === 'POST' && req.url === '/buy-stadium') {
+    try {
+      const { accountId } = await parseBody(req);
+      if (!accountId) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing accountId' })); }
+      if (data.stadiumOwners[accountId]) return res.end(JSON.stringify({ error: 'You already own a stadium' }));
+      if (data.stadiumsSold >= 1000) return res.end(JSON.stringify({ error: 'All stadiums sold out' }));
+      const user = data.users[accountId];
+      if (!user || typeof user.balance !== 'number') return res.end(JSON.stringify({ error: 'User data not found. Please sync your wallet first.' }));
+      const price = 2000;
+      if (user.balance < price) return res.end(JSON.stringify({ error: 'Insufficient balance. You need 2000 $FOOT.' }));
+      user.balance -= price;
+      data.stadiumsSold++;
+      data.stadiumOwners[accountId] = true;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, newBalance: user.balance, sold: data.stadiumsSold }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Admin stats (no auth)
+  else if (req.method === 'GET' && req.url.startsWith('/admin-stats')) {
+    const stats = {
+      totalMiners: data.totalMiners,
+      totalDistributed: data.totalDistributed,
+      stadiumsSold: data.stadiumsSold,
+      minersCounted: data.minersCounted,
+      claims: data.claims,
+      users: data.users,
+      referrals: data.referrals,
+      referralRewards: data.referralRewards,
+      referralFriends: data.referralFriends
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(stats));
+  }
+
+  // Admin adjust distribution
+  else if (req.method === 'POST' && req.url === '/admin-adjust-distribution') {
+    try {
+      const { amount } = await parseBody(req);
+      if (typeof amount !== 'number') { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid amount' })); }
+      data.totalDistributed += amount;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Admin set distribution
+  else if (req.method === 'POST' && req.url === '/admin-set-distribution') {
+    try {
+      const { value } = await parseBody(req);
+      if (typeof value !== 'number' || value < 0) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid value' })); }
+      data.totalDistributed = value;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
+  }
+
+  // Admin recover distribution
+  else if (req.method === 'POST' && req.url === '/admin-recover-distribution') {
+    try {
       let total = 0;
-      for (let attr in attrs) {
-        const lv = attrs[attr] || 0;
-        for (let l = 0; l < lv; l++) total += getUpgradeCost(l);
+      for (const accountId in data.users) {
+        const u = data.users[accountId];
+        total += (u.balance || 0);
+        if (u.attributes) total += getTotalSpent(u.attributes);
       }
-      return total;
-    }
+      data.totalDistributed = total;
+      saveData();
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' })); }
+  }
 
-    async function fetchData() {
-      try {
-        // Use relative URL – works everywhere
-        const res = await fetch('/admin-stats');
-        if (!res.ok) throw new Error('Failed');
-        const data = await res.json();
-        document.getElementById('connectionStatus').innerText = '✅ Connected';
-        document.getElementById('dashboard').style.display = 'block';
-        renderDashboard(data);
-        renderAttributes(data);
-        document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);
-        fetchUpdates();
-      } catch(e) {
-        document.getElementById('connectionStatus').innerText = '❌ Connection failed — check server';
-      }
-    }
+  // Fallback
+  else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+});
 
-    function renderDashboard(data) {
-      const grid = document.getElementById('overviewGrid');
-      grid.innerHTML = `
-        <div class="card"><h2>Total Miners</h2><div class="stat">${data.totalMiners}</div></div>
-        <div class="card"><h2>Total Distributed</h2><div class="stat">${data.totalDistributed.toLocaleString()}</div></div>
-        <div class="card"><h2>Stadiums Sold</h2><div class="stat">${data.stadiumsSold || 0} / 1000</div></div>
-        <div class="card"><h2>Referral Codes</h2><div class="stat">${Object.keys(data.referralRewards).length}</div></div>
-        <div class="card"><h2>Active Claimers</h2><div class="stat">${Object.keys(data.claims).length}</div></div>
-        <div class="card"><h2>Synced Users</h2><div class="stat">${Object.keys(data.users).length}</div></div>
-      `;
-    }
-
-    function renderAttributes(data) {
-      const tbody = document.getElementById('attributesBody');
-      const noMsg = document.getElementById('noPlayersMsg');
-      tbody.innerHTML = '';
-      const users = data.users || {};
-      let hasAny = false;
-
-      for (const [accountId, user] of Object.entries(users)) {
-        const attrs = user.attributes;
-        if (!attrs || Object.keys(attrs).length === 0) continue;
-        hasAny = true;
-        const username = user.username || '—';
-        const balance = user.balance !== undefined ? user.balance.toFixed(2) : '0.00';
-        const row = document.createElement('tr');
-        row.innerHTML = `
-          <td>${accountId}</td>
-          <td>${username}</td>
-          <td>${balance}</td>
-          ${ATTR_NAMES.map(a => `<td>${attrs[a] || 0}</td>`).join('')}
-          <td>${calcTotalSpent(attrs).toFixed(2)}</td>
-        `;
-        tbody.appendChild(row);
-      }
-
-      noMsg.style.display = hasAny ? 'none' : 'block';
-    }
-
-    async function fetchUpdates() {
-      const res = await fetch('/updates');
-      const updates = await res.json();
-      const list = document.getElementById('updatesList');
-      list.innerHTML = updates.map(u => `
-        <div style="background:#151520; padding:0.8rem; border-radius:8px; margin-bottom:0.5rem; display:flex; justify-content:space-between; align-items:center;">
-          <div>
-            <strong style="color:#ffaaaa;">${u.title}</strong> <small>(${u.date})</small><br>
-            ${u.content}
-          </div>
-          <button class="btn danger" onclick="deleteUpdate('${u.id}')">Delete</button>
-        </div>
-      `).join('');
-    }
-
-    async function postUpdate() {
-      const title = document.getElementById('updateTitle').value.trim();
-      const content = document.getElementById('updateContent').value.trim();
-      if (!title || !content) return alert('Fill both fields');
-      const res = await fetch('/admin-update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, content })
-      });
-      if (res.ok) {
-        document.getElementById('updateTitle').value = '';
-        document.getElementById('updateContent').value = '';
-        fetchUpdates();
-      } else alert('Failed');
-    }
-
-    async function deleteUpdate(id) {
-      if (!confirm('Delete this update?')) return;
-      const res = await fetch(`/admin-update?id=${id}`, { method: 'DELETE' });
-      if (res.ok) fetchUpdates(); else alert('Failed');
-    }
-
-    async function adjustDistribution() {
-      const amount = prompt('Amount to add (can be negative):', '0');
-      if (amount === null) return;
-      const res = await fetch('/admin-adjust-distribution', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount: Number(amount) })
-      });
-      if (res.ok) fetchData();
-      else alert('Failed');
-    }
-
-    async function setDistribution() {
-      const value = prompt('New total distributed:', '0');
-      if (value === null) return;
-      const res = await fetch('/admin-set-distribution', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ value: Number(value) })
-      });
-      if (res.ok) fetchData();
-      else alert('Failed');
-    }
-
-    async function recoverDistribution() {
-      if (!confirm('Recalculate totalDistributed from synced users?')) return;
-      const res = await fetch('/admin-recover-distribution', { method: 'POST' });
-      if (res.ok) fetchData();
-      else alert('Failed');
-    }
-
-    function copyFullData() {
-      const text = document.getElementById('rawJson').textContent;
-      navigator.clipboard.writeText(text);
-      alert('Copied!');
-    }
-
-    fetchData();
-  </script>
-</body>
-</html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>METAFOOT Admin</title>
-  <style>
-    :root {
-      --bg: #0a0a0f;
-      --card: #151520;
-      --text: #ffcccc;
-      --accent: #ff5555;
-      --gold: #ffd700;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; padding: 20px; }
-    h1 { color: var(--accent); margin-bottom: 0.5rem; }
-    .status { color: #ff8888; margin-bottom: 1rem; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
-    .card { background: var(--card); border: 1px solid #333; border-radius: 12px; padding: 1rem; }
-    .card h2 { color: var(--accent); font-size: 1.1rem; margin-bottom: 0.5rem; }
-    .stat { font-size: 2rem; color: var(--gold); }
-    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
-    th, td { border: 1px solid #333; padding: 6px; text-align: left; font-size: 0.9rem; }
-    th { background: #1a1a2a; color: var(--gold); }
-    textarea { width: 100%; background: #1a1a2a; color: white; border: 1px solid var(--accent); padding: 0.5rem; border-radius: 8px; resize: vertical; }
-    .section { margin-top: 2rem; }
-    .btn { padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 6px; cursor: pointer; margin-right: 5px; margin-bottom: 5px; }
-    .danger { background: #990000; }
-    .success { background: #228B22; }
-    pre { background: #111; padding: 1rem; border-radius: 8px; overflow-x: auto; max-height: 300px; }
-    .scrollable { max-height: 500px; overflow-y: auto; }
-  </style>
-</head>
-<body>
-  <h1>⚽ METAFOOT Admin</h1>
-  <p class="status" id="connectionStatus">Connecting…</p>
-
-  <div id="dashboard" style="display: none;">
-    <div class="grid" id="overviewGrid"></div>
-
-    <!-- Player Attributes Section -->
-    <div class="section">
-      <h2>🏋️ Player Attributes</h2>
-      <div class="scrollable">
-        <table id="attributesTable">
-          <thead>
-            <tr>
-              <th>Account ID</th>
-              <th>Username</th>
-              <th>Balance</th>
-              <th>Speed</th>
-              <th>Shoot</th>
-              <th>Power</th>
-              <th>Intelligence</th>
-              <th>Brilliance</th>
-              <th>Accuracy</th>
-              <th>Total Spent</th>
-            </tr>
-          </thead>
-          <tbody id="attributesBody"></tbody>
-        </table>
-      </div>
-      <p id="noPlayersMsg" style="color:#888; margin-top:1rem;">No players with attributes found.</p>
-    </div>
-
-    <div class="section">
-      <h2>📋 All Data (JSON)</h2>
-      <button class="btn" onclick="copyFullData()">Copy Full JSON</button>
-      <pre id="rawJson"></pre>
-    </div>
-
-    <div class="section">
-      <h2>📝 Manage Updates</h2>
-      <div style="display: flex; gap: 10px; margin-bottom: 10px;">
-        <input type="text" id="updateTitle" placeholder="Title" style="flex:1; padding:8px; background:#1a1a2a; border:1px solid #ff5555; color:white; border-radius:6px;">
-        <textarea id="updateContent" placeholder="Content" rows="2" style="flex:2;"></textarea>
-        <button class="btn success" onclick="postUpdate()">Post Update</button>
-      </div>
-      <div id="updatesList"></div>
-    </div>
-
-    <div class="section">
-      <h2>🔧 Tools</h2>
-      <button class="btn" onclick="adjustDistribution()">Adjust Distribution</button>
-      <button class="btn" onclick="setDistribution()">Set Distribution</button>
-      <button class="btn danger" onclick="recoverDistribution()">Recover from Users</button>
-    </div>
-  </div>
-
-  <script>
-    // No API_BASE needed – we always call the same server we’re on.
-    const ATTR_NAMES = ['speed','shoot','power','intelligence','brilliance','accuracy'];
-    const BASE_COST = 0.3;
-    const TIER_SIZE = 20;
-
-    function getUpgradeCost(level) {
-      return BASE_COST * Math.pow(2, Math.floor(level / TIER_SIZE));
-    }
-
-    function calcTotalSpent(attrs) {
-      let total = 0;
-      for (let attr in attrs) {
-        const lv = attrs[attr] || 0;
-        for (let l = 0; l < lv; l++) total += getUpgradeCost(l);
-      }
-      return total;
-    }
-
-    async function fetchData() {
-      try {
-        // Use relative URL – works everywhere
-        const res = await fetch('/admin-stats');
-        if (!res.ok) throw new Error('Failed');
-        const data = await res.json();
-        document.getElementById('connectionStatus').innerText = '✅ Connected';
-        document.getElementById('dashboard').style.display = 'block';
-        renderDashboard(data);
-        renderAttributes(data);
-        document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);
-        fetchUpdates();
-      } catch(e) {
-        document.getElementById('connectionStatus').innerText = '❌ Connection failed — check server';
-      }
-    }
-
-    function renderDashboard(data) {
-      const grid = document.getElementById('overviewGrid');
-      grid.innerHTML = `
-        <div class="card"><h2>Total Miners</h2><div class="stat">${data.totalMiners}</div></div>
-        <div class="card"><h2>Total Distributed</h2><div class="stat">${data.totalDistributed.toLocaleString()}</div></div>
-        <div class="card"><h2>Stadiums Sold</h2><div class="stat">${data.stadiumsSold || 0} / 1000</div></div>
-        <div class="card"><h2>Referral Codes</h2><div class="stat">${Object.keys(data.referralRewards).length}</div></div>
-        <div class="card"><h2>Active Claimers</h2><div class="stat">${Object.keys(data.claims).length}</div></div>
-        <div class="card"><h2>Synced Users</h2><div class="stat">${Object.keys(data.users).length}</div></div>
-      `;
-    }
-
-    function renderAttributes(data) {
-      const tbody = document.getElementById('attributesBody');
-      const noMsg = document.getElementById('noPlayersMsg');
-      tbody.innerHTML = '';
-      const users = data.users || {};
-      let hasAny = false;
-
-      for (const [accountId, user] of Object.entries(users)) {
-        const attrs = user.attributes;
-        if (!attrs || Object.keys(attrs).length === 0) continue;
-        hasAny = true;
-        const username = user.username || '—';
-        const balance = user.balance !== undefined ? user.balance.toFixed(2) : '0.00';
-        const row = document.createElement('tr');
-        row.innerHTML = `
-          <td>${accountId}</td>
-          <td>${username}</td>
-          <td>${balance}</td>
-          ${ATTR_NAMES.map(a => `<td>${attrs[a] || 0}</td>`).join('')}
-          <td>${calcTotalSpent(attrs).toFixed(2)}</td>
-        `;
-        tbody.appendChild(row);
-      }
-
-      noMsg.style.display = hasAny ? 'none' : 'block';
-    }
-
-    async function fetchUpdates() {
-      const res = await fetch('/updates');
-      const updates = await res.json();
-      const list = document.getElementById('updatesList');
-      list.innerHTML = updates.map(u => `
-        <div style="background:#151520; padding:0.8rem; border-radius:8px; margin-bottom:0.5rem; display:flex; justify-content:space-between; align-items:center;">
-          <div>
-            <strong style="color:#ffaaaa;">${u.title}</strong> <small>(${u.date})</small><br>
-            ${u.content}
-          </div>
-          <button class="btn danger" onclick="deleteUpdate('${u.id}')">Delete</button>
-        </div>
-      `).join('');
-    }
-
-    async function postUpdate() {
-      const title = document.getElementById('updateTitle').value.trim();
-      const content = document.getElementById('updateContent').value.trim();
-      if (!title || !content) return alert('Fill both fields');
-      const res = await fetch('/admin-update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, content })
-      });
-      if (res.ok) {
-        document.getElementById('updateTitle').value = '';
-        document.getElementById('updateContent').value = '';
-        fetchUpdates();
-      } else alert('Failed');
-    }
-
-    async function deleteUpdate(id) {
-      if (!confirm('Delete this update?')) return;
-      const res = await fetch(`/admin-update?id=${id}`, { method: 'DELETE' });
-      if (res.ok) fetchUpdates(); else alert('Failed');
-    }
-
-    async function adjustDistribution() {
-      const amount = prompt('Amount to add (can be negative):', '0');
-      if (amount === null) return;
-      const res = await fetch('/admin-adjust-distribution', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount: Number(amount) })
-      });
-      if (res.ok) fetchData();
-      else alert('Failed');
-    }
-
-    async function setDistribution() {
-      const value = prompt('New total distributed:', '0');
-      if (value === null) return;
-      const res = await fetch('/admin-set-distribution', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ value: Number(value) })
-      });
-      if (res.ok) fetchData();
-      else alert('Failed');
-    }
-
-    async function recoverDistribution() {
-      if (!confirm('Recalculate totalDistributed from synced users?')) return;
-      const res = await fetch('/admin-recover-distribution', { method: 'POST' });
-      if (res.ok) fetchData();
-      else alert('Failed');
-    }
-
-    function copyFullData() {
-      const text = document.getElementById('rawJson').textContent;
-      navigator.clipboard.writeText(text);
-      alert('Copied!');
-    }
-
-    fetchData();
-  </script>
-</body>
-</html>
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
