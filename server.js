@@ -1,4 +1,4 @@
-// server.js — Full backend (admin endpoints open – no auth)
+// server.js — PostgreSQL + file fallback. Safe data forever.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -6,21 +6,51 @@ const path = require('path');
 const DATA_FILE = path.join(__dirname, 'miners.json');
 const PORT = process.env.PORT || 3000;
 
-// --------------- Persistent data ---------------
-let data = {
-  minersCounted: {},      // { accountId: true }
-  totalMiners: 0,
-  totalDistributed: 0,
-  claims: {},             // { accountId: timestamp }
-  users: {},              // { accountId: { balance, attributes, username, ... } }
-  referrals: [],
-  referralRewards: {},
-  referralFriends: {},
-  updates: [],
-  stadiumsSold: 0,
-  stadiumOwners: {}
-};
+// ---------- Storage logic ----------
+let data = {};
+let saveData;          // will be set to either dbSave or fileSave
+let loadData;          // will be set to either dbLoad or fileLoad
 
+// ---------- File‑based functions ----------
+function fileLoad() {
+  if (fs.existsSync(DATA_FILE)) {
+    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  }
+  return {};
+}
+
+function fileSave() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data));
+}
+
+// ---------- PostgreSQL‑based functions ----------
+let db;
+async function dbLoad() {
+  const { Client } = require('pg');
+  db = new Client({ connectionString: process.env.DATABASE_URL });
+  await db.connect();
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS app_data (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      data JSONB NOT NULL
+    )
+  `);
+
+  await db.query(`
+    INSERT INTO app_data (id, data) VALUES (1, $1)
+    ON CONFLICT (id) DO NOTHING
+  `, [JSON.stringify(data)]);
+
+  const res = await db.query('SELECT data FROM app_data WHERE id = 1');
+  return res.rows[0].data;
+}
+
+async function dbSave() {
+  await db.query('UPDATE app_data SET data = $1 WHERE id = 1', [JSON.stringify(data)]);
+}
+
+// ---------- Training cost constants ----------
 const BASE_COST = 0.3;
 const TIER_SIZE = 20;
 
@@ -38,27 +68,22 @@ function getTotalSpent(attrs) {
   return total;
 }
 
-try {
-  if (fs.existsSync(DATA_FILE)) {
-    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    data.minersCounted = data.minersCounted || {};
-    data.totalMiners = data.totalMiners || 0;
-    data.totalDistributed = data.totalDistributed || 0;
-    data.claims = data.claims || {};
-    data.users = data.users || {};
-    data.referrals = data.referrals || [];
-    data.referralRewards = data.referralRewards || {};
-    data.referralFriends = data.referralFriends || {};
-    data.updates = data.updates || [];
-    data.stadiumsSold = data.stadiumsSold || 0;
-    data.stadiumOwners = data.stadiumOwners || {};
-  }
-} catch (e) {}
+// ---------- Default data structure ----------
+const defaultData = {
+  minersCounted: {},
+  totalMiners: 0,
+  totalDistributed: 0,
+  claims: {},
+  users: {},
+  referrals: [],
+  referralRewards: {},
+  referralFriends: {},
+  updates: [],
+  stadiumsSold: 0,
+  stadiumOwners: {}
+};
 
-function saveData() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data));
-}
-
+// ---------- Helper ----------
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -88,6 +113,7 @@ function getReferralReward() {
   return base / 16;
 }
 
+// ===================== SERVER =====================
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -110,7 +136,7 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify(data.updates));
   }
 
-  // Admin: post an update (NO AUTH)
+  // Admin: post an update
   if (req.method === 'POST' && req.url.startsWith('/admin-update')) {
     try {
       const { title, content } = await parseBody(req);
@@ -125,7 +151,7 @@ const server = http.createServer(async (req, res) => {
         date: new Date().toISOString().split('T')[0]
       };
       data.updates.unshift(newUpdate);
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, update: newUpdate }));
     } catch (e) {
@@ -134,7 +160,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Admin: delete an update (NO AUTH)
+  // Admin: delete an update
   if (req.method === 'DELETE' && req.url.startsWith('/admin-update')) {
     const url = new URL(req.url, `http://localhost`);
     const id = url.searchParams.get('id');
@@ -148,7 +174,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: 'Update not found' }));
     }
     data.updates.splice(index, 1);
-    saveData();
+    await saveData();
     res.writeHead(200);
     res.end(JSON.stringify({ success: true }));
   }
@@ -166,7 +192,7 @@ const server = http.createServer(async (req, res) => {
       }
       data.minersCounted[accountId] = true;
       data.totalMiners++;
-      saveData();
+      await saveData();
       return res.end(JSON.stringify({ alreadyCounted: false, totalMiners: data.totalMiners }));
     } catch (e) {
       res.writeHead(400);
@@ -202,7 +228,7 @@ const server = http.createServer(async (req, res) => {
       if (data.users[accountId]) {
         data.users[accountId].balance = (data.users[accountId].balance || 0) + rate;
       }
-      saveData();
+      await saveData();
       res.end(JSON.stringify({ success: true, reward: rate, totalMiners: data.totalMiners, totalDistributed: data.totalDistributed }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
   }
@@ -219,7 +245,7 @@ const server = http.createServer(async (req, res) => {
       const { accountId, userData } = await parseBody(req);
       if (!accountId || !userData) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing accountId or userData' })); }
       data.users[accountId] = { ...userData, serverTimestamp: Date.now() };
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
@@ -243,7 +269,7 @@ const server = http.createServer(async (req, res) => {
       if (!accountId || !taskType || !amount) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing fields' })); }
       data.totalDistributed += amount;
       if (data.users[accountId]) data.users[accountId].balance = (data.users[accountId].balance || 0) + amount;
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
@@ -256,7 +282,7 @@ const server = http.createServer(async (req, res) => {
       if (!accountId || !amount) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing fields' })); }
       data.totalDistributed += amount;
       if (data.users[accountId]) data.users[accountId].balance = (data.users[accountId].balance || 0) + amount;
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
@@ -278,7 +304,7 @@ const server = http.createServer(async (req, res) => {
       data.referralRewards[referrerCode] = (data.referralRewards[referrerCode] || 0) + reward;
       data.referralFriends[referrerCode] = data.referralFriends[referrerCode] || [];
       data.referralFriends[referrerCode].push({ referred: referredCode, timestamp: Date.now() });
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, reward, message: 'Referral added.' }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
@@ -313,13 +339,13 @@ const server = http.createServer(async (req, res) => {
       user.balance -= price;
       data.stadiumsSold++;
       data.stadiumOwners[accountId] = true;
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, newBalance: user.balance, sold: data.stadiumsSold }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
   }
 
-  // Admin stats (no auth)
+  // Admin stats
   else if (req.method === 'GET' && req.url.startsWith('/admin-stats')) {
     const stats = {
       totalMiners: data.totalMiners,
@@ -342,7 +368,7 @@ const server = http.createServer(async (req, res) => {
       const { amount } = await parseBody(req);
       if (typeof amount !== 'number') { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid amount' })); }
       data.totalDistributed += amount;
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
@@ -354,7 +380,7 @@ const server = http.createServer(async (req, res) => {
       const { value } = await parseBody(req);
       if (typeof value !== 'number' || value < 0) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid value' })); }
       data.totalDistributed = value;
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
     } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Bad request' })); }
@@ -370,10 +396,31 @@ const server = http.createServer(async (req, res) => {
         if (u.attributes) total += getTotalSpent(u.attributes);
       }
       data.totalDistributed = total;
-      saveData();
+      await saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' })); }
+  }
+
+  // Export for Unity
+  else if (req.method === 'GET' && req.url === '/data-export') {
+    const exportData = {
+      global: {
+        totalMiners: data.totalMiners,
+        totalDistributed: data.totalDistributed
+      },
+      players: data.users,
+      claims: data.claims,
+      referrals: data.referrals,
+      updates: data.updates,
+      stadiums: {
+        sold: data.stadiumsSold,
+        total: 1000,
+        owners: data.stadiumOwners
+      }
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(exportData, null, 2));
   }
 
   // Fallback
@@ -383,4 +430,23 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ===================== STARTUP =====================
+async function start() {
+  if (process.env.DATABASE_URL) {
+    // PostgreSQL mode (Render)
+    console.log('Using PostgreSQL database');
+    loadData = dbLoad;
+    saveData = dbSave;
+    data = { ...defaultData };
+    data = { ...defaultData, ...(await loadData()) };
+  } else {
+    // File mode (local)
+    console.log('Using local miners.json');
+    loadData = fileLoad;
+    saveData = fileSave;
+    data = { ...defaultData, ...loadData() };
+  }
+  server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
+
+start();
