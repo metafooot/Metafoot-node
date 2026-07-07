@@ -1,13 +1,11 @@
 // server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server + updates system + stadium sales
+// ⚠️ Admin endpoints have NO authentication – only use on localhost or behind a firewall.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const DATA_FILE = path.join(__dirname, 'miners.json');
 const PORT = process.env.PORT || 3000;
-
-// ---- CHANGE THIS TO YOUR OWN SECRET KEY ----
-const ADMIN_KEY = process.env.ADMIN_KEY || 'mysecret123';
 
 // --------------- Persistent data ---------------
 let data = {
@@ -120,14 +118,8 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify(data.updates));
   }
 
-  // --- Admin: post an update ---
+  // --- Admin: post an update (NO AUTH) ---
   if (req.method === 'POST' && req.url.startsWith('/admin-update')) {
-    const url = new URL(req.url, `http://localhost`);
-    const key = url.searchParams.get('key');
-    if (key !== ADMIN_KEY) {
-      res.writeHead(403);
-      return res.end(JSON.stringify({ error: 'Forbidden' }));
-    }
     try {
       const { title, content } = await parseBody(req);
       if (!title || !content) {
@@ -150,14 +142,9 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // --- Admin: delete an update ---
+  // --- Admin: delete an update (NO AUTH) ---
   if (req.method === 'DELETE' && req.url.startsWith('/admin-update')) {
     const url = new URL(req.url, `http://localhost`);
-    const key = url.searchParams.get('key');
-    if (key !== ADMIN_KEY) {
-      res.writeHead(403);
-      return res.end(JSON.stringify({ error: 'Forbidden' }));
-    }
     const id = url.searchParams.get('id');
     if (!id) {
       res.writeHead(400);
@@ -355,8 +342,6 @@ const server = http.createServer(async (req, res) => {
         referred: referredCode,
         timestamp: Date.now()
       });
-      // Add reward to referrer's server-side balance if known
-      // (Note: we don't have accountId mapping here, but it's optional)
       saveData();
       res.writeHead(200);
       res.end(JSON.stringify({
@@ -389,7 +374,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ===================== STADIUM ENDPOINTS =====================
-  // --- Get stadium info (remaining supply) ---
+  // --- Get stadium info ---
   if (req.method === 'GET' && req.url === '/stadium-info') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -406,36 +391,24 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400);
         return res.end(JSON.stringify({ error: 'Missing accountId' }));
       }
-
-      // Check if already owns a stadium
       if (data.stadiumOwners[accountId]) {
         return res.end(JSON.stringify({ error: 'You already own a stadium' }));
       }
-
-      // Check supply
       if (data.stadiumsSold >= 1000) {
         return res.end(JSON.stringify({ error: 'All stadiums sold out' }));
       }
-
-      // Check user data exists and has balance
       const user = data.users[accountId];
       if (!user || typeof user.balance !== 'number') {
         return res.end(JSON.stringify({ error: 'User data not found. Please sync your wallet first.' }));
       }
-
       const price = 2000;
       if (user.balance < price) {
         return res.end(JSON.stringify({ error: 'Insufficient balance. You need 2000 $FOOT.' }));
       }
-
-      // Deduct balance
       user.balance -= price;
-      // Record purchase
       data.stadiumsSold++;
       data.stadiumOwners[accountId] = true;
-      // Note: totalDistributed doesn't change (purchase is a transfer, not minting)
       saveData();
-
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, newBalance: user.balance, sold: data.stadiumsSold }));
     } catch (e) {
@@ -444,15 +417,26 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ===================== ADMIN ENDPOINTS =====================
+  // ===================== ADMIN ENDPOINTS (NO AUTH) =====================
+  // --- Admin stats ---
+  else if (req.method === 'GET' && req.url.startsWith('/admin-stats')) {
+    const stats = {
+      totalMiners: data.totalMiners,
+      totalDistributed: data.totalDistributed,
+      stadiumsSold: data.stadiumsSold,
+      minersCounted: data.minersCounted,
+      claims: data.claims,
+      users: data.users,
+      referrals: data.referrals,
+      referralRewards: data.referralRewards,
+      referralFriends: data.referralFriends
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(stats));
+  }
+
   // --- Admin: adjust totalDistributed (add/subtract) ---
   else if (req.method === 'POST' && req.url === '/admin-adjust-distribution') {
-    const url = new URL(req.url, `http://localhost`);
-    const key = url.searchParams.get('key');
-    if (key !== ADMIN_KEY) {
-      res.writeHead(403);
-      return res.end(JSON.stringify({ error: 'Forbidden' }));
-    }
     try {
       const { amount } = await parseBody(req);
       if (typeof amount !== 'number') {
@@ -471,12 +455,6 @@ const server = http.createServer(async (req, res) => {
 
   // --- Admin: set totalDistributed directly ---
   else if (req.method === 'POST' && req.url === '/admin-set-distribution') {
-    const url = new URL(req.url, `http://localhost`);
-    const key = url.searchParams.get('key');
-    if (key !== ADMIN_KEY) {
-      res.writeHead(403);
-      return res.end(JSON.stringify({ error: 'Forbidden' }));
-    }
     try {
       const { value } = await parseBody(req);
       if (typeof value !== 'number' || value < 0) {
@@ -495,12 +473,6 @@ const server = http.createServer(async (req, res) => {
 
   // --- Admin: recover totalDistributed from user data ---
   else if (req.method === 'POST' && req.url === '/admin-recover-distribution') {
-    const url = new URL(req.url, `http://localhost`);
-    const key = url.searchParams.get('key');
-    if (key !== ADMIN_KEY) {
-      res.writeHead(403);
-      return res.end(JSON.stringify({ error: 'Forbidden' }));
-    }
     try {
       let total = 0;
       const users = data.users || {};
@@ -521,29 +493,6 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500);
       res.end(JSON.stringify({ error: 'Internal error' }));
     }
-  }
-
-  // --- Admin stats (protected) ---
-  else if (req.method === 'GET' && req.url.startsWith('/admin-stats')) {
-    const url = new URL(req.url, `http://localhost`);
-    const key = url.searchParams.get('key');
-    if (key !== ADMIN_KEY) {
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Forbidden' }));
-    }
-    const stats = {
-      totalMiners: data.totalMiners,
-      totalDistributed: data.totalDistributed,
-      stadiumsSold: data.stadiumsSold,
-      minersCounted: data.minersCounted,
-      claims: data.claims,
-      users: data.users,
-      referrals: data.referrals,
-      referralRewards: data.referralRewards,
-      referralFriends: data.referralFriends
-    };
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(stats));
   }
 
   // --- Fallback ---
