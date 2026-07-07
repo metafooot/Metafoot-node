@@ -1,4 +1,4 @@
-// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server + updates system
+// server.js — Global counter + claim engine + cloud user data + admin stats + health check + referral server + updates system + stadium sales
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -15,11 +15,14 @@ let data = {
   totalMiners: 0,
   totalDistributed: 0,
   claims: {},             // { accountId: timestamp }
-  users: {},              // { accountId: userData }
-  referrals: [],          // { referrer: string (referralCode), referred: string (referralCode), timestamp: number }
+  users: {},              // { accountId: { balance, attributes, username, ... } }
+  referrals: [],          // { referrer, referred, timestamp }
   referralRewards: {},    // { referralCode: totalEarned }
   referralFriends: {},    // { referralCode: [ { referred, timestamp } ] }
-  updates: []             // All updates live here
+  updates: [],            // All updates live here
+  // ---------- Stadium ----------
+  stadiumsSold: 0,                 // number of stadiums sold (max 1000)
+  stadiumOwners: {}                // { accountId: true } to prevent double purchase
 };
 
 // --------- Training cost constants ---------
@@ -46,7 +49,7 @@ function getTotalSpent(attrs) {
 try {
   if (fs.existsSync(DATA_FILE)) {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    // ensure all keys exist, even if loading an older file
+    // ensure all keys exist
     data.minersCounted = data.minersCounted || {};
     data.totalMiners = data.totalMiners || 0;
     data.totalDistributed = data.totalDistributed || 0;
@@ -56,6 +59,8 @@ try {
     data.referralRewards = data.referralRewards || {};
     data.referralFriends = data.referralFriends || {};
     data.updates = data.updates || [];
+    data.stadiumsSold = data.stadiumsSold || 0;
+    data.stadiumOwners = data.stadiumOwners || {};
   }
 } catch (e) {}
 
@@ -218,6 +223,10 @@ const server = http.createServer(async (req, res) => {
       }
       data.claims[accountId] = now;
       data.totalDistributed += rate;
+      // Update user balance on server (if user data exists)
+      if (data.users[accountId]) {
+        data.users[accountId].balance = (data.users[accountId].balance || 0) + rate;
+      }
       saveData();
       res.end(JSON.stringify({ success: true, reward: rate, totalMiners: data.totalMiners, totalDistributed: data.totalDistributed }));
     } catch (e) {
@@ -277,6 +286,9 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Missing fields' }));
       }
       data.totalDistributed += amount;
+      if (data.users[accountId]) {
+        data.users[accountId].balance = (data.users[accountId].balance || 0) + amount;
+      }
       saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
@@ -295,6 +307,9 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Missing fields' }));
       }
       data.totalDistributed += amount;
+      if (data.users[accountId]) {
+        data.users[accountId].balance = (data.users[accountId].balance || 0) + amount;
+      }
       saveData();
       res.writeHead(200);
       res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed }));
@@ -340,6 +355,8 @@ const server = http.createServer(async (req, res) => {
         referred: referredCode,
         timestamp: Date.now()
       });
+      // Add reward to referrer's server-side balance if known
+      // (Note: we don't have accountId mapping here, but it's optional)
       saveData();
       res.writeHead(200);
       res.end(JSON.stringify({
@@ -371,6 +388,63 @@ const server = http.createServer(async (req, res) => {
     }));
   }
 
+  // ===================== STADIUM ENDPOINTS =====================
+  // --- Get stadium info (remaining supply) ---
+  if (req.method === 'GET' && req.url === '/stadium-info') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      sold: data.stadiumsSold,
+      total: 1000
+    }));
+  }
+
+  // --- Buy a stadium ---
+  else if (req.method === 'POST' && req.url === '/buy-stadium') {
+    try {
+      const { accountId } = await parseBody(req);
+      if (!accountId) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Missing accountId' }));
+      }
+
+      // Check if already owns a stadium
+      if (data.stadiumOwners[accountId]) {
+        return res.end(JSON.stringify({ error: 'You already own a stadium' }));
+      }
+
+      // Check supply
+      if (data.stadiumsSold >= 1000) {
+        return res.end(JSON.stringify({ error: 'All stadiums sold out' }));
+      }
+
+      // Check user data exists and has balance
+      const user = data.users[accountId];
+      if (!user || typeof user.balance !== 'number') {
+        return res.end(JSON.stringify({ error: 'User data not found. Please sync your wallet first.' }));
+      }
+
+      const price = 2000;
+      if (user.balance < price) {
+        return res.end(JSON.stringify({ error: 'Insufficient balance. You need 2000 $FOOT.' }));
+      }
+
+      // Deduct balance
+      user.balance -= price;
+      // Record purchase
+      data.stadiumsSold++;
+      data.stadiumOwners[accountId] = true;
+      // Note: totalDistributed doesn't change (purchase is a transfer, not minting)
+      saveData();
+
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, newBalance: user.balance, sold: data.stadiumsSold }));
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Bad request' }));
+    }
+  }
+
+  // ===================== ADMIN ENDPOINTS =====================
   // --- Admin: adjust totalDistributed (add/subtract) ---
   else if (req.method === 'POST' && req.url === '/admin-adjust-distribution') {
     const url = new URL(req.url, `http://localhost`);
@@ -433,9 +507,7 @@ const server = http.createServer(async (req, res) => {
       for (const accountId in users) {
         const userData = users[accountId];
         if (userData && typeof userData === 'object') {
-          // Add user balance (if any)
           total += (userData.balance || 0);
-          // Add training spent (if attributes exist)
           if (userData.attributes) {
             total += getTotalSpent(userData.attributes);
           }
@@ -444,7 +516,7 @@ const server = http.createServer(async (req, res) => {
       data.totalDistributed = total;
       saveData();
       res.writeHead(200);
-      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed, note: 'Recovered from synced user data. This does not include unsynced users or extra bonuses.' }));
+      res.end(JSON.stringify({ success: true, totalDistributed: data.totalDistributed, note: 'Recovered from synced user data.' }));
     } catch (e) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: 'Internal error' }));
@@ -462,6 +534,7 @@ const server = http.createServer(async (req, res) => {
     const stats = {
       totalMiners: data.totalMiners,
       totalDistributed: data.totalDistributed,
+      stadiumsSold: data.stadiumsSold,
       minersCounted: data.minersCounted,
       claims: data.claims,
       users: data.users,
